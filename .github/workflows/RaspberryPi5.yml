@@ -31,7 +31,8 @@ jobs:
       env:
         DEBIAN_FRONTEND: noninteractive
       run: |
-        sudo rm -rf /etc/apt/sources.list.d/* 
+        set -e
+        sudo rm -rf /etc/apt/sources.list.d/*
         sudo -E apt-get -qq update
         sudo -E apt-get -qq install $(curl -fsSL https://raw.githubusercontent.com/bigbugcc/openwrts/master/openwrt-env)
         sudo -E apt-get -qq autoremove --purge
@@ -43,24 +44,23 @@ jobs:
     - name: Clone source code
       working-directory: /mnt/workdir
       run: |
+        set -e
         df -hT $PWD
-        git clone --depth 1 $REPO_URL -b $REPO_BRANCH openwrt
-        ln -sf /mnt/workdir/openwrt $GITHUB_WORKSPACE/openwrt
+        git clone --depth 1 "$REPO_URL" -b "$REPO_BRANCH" openwrt
+        ln -sf /mnt/workdir/openwrt "$GITHUB_WORKSPACE/openwrt"
 
-    - name: Fix patch file
+    - name: Fix kernel patch for RPi5
       run: |
+        set -e
         cd openwrt
-        # 删除或重命名有问题的补丁文件（在编译前处理）
-        # 处理 patches-6.12 目录下的补丁文件
         PATCH_DIR="target/linux/bcm27xx"
         PATCH_NAME="950-0358-mmc-sdhci-of-dwcmshc-define-sdio-timeout-clocks.patch"
-        
-        # 查找所有可能的内核版本目录并处理补丁文件
+
         for patch_dir in ${PATCH_DIR}/patches-*; do
           if [ -d "$patch_dir" ]; then
             PATCH_FILE="${patch_dir}/${PATCH_NAME}"
             if [ -f "$PATCH_FILE" ]; then
-              echo "发现补丁文件 $PATCH_FILE，将其重命名为 .patch.disabled"
+              echo "发现补丁文件 $PATCH_FILE，将其重命名为 .patch.disabled 以避免 Patch failed"
               mv "$PATCH_FILE" "${PATCH_FILE}.disabled" || true
             fi
           fi
@@ -69,69 +69,107 @@ jobs:
     - name: Cache
       uses: stupidloud/cachewrtbuild@main
       with:
-          ccache: 'true'
-          mixkey: 'rpi5'
-          prefix: 'openwrt'
+        ccache: 'true'
+        mixkey: 'rpi5'
+        prefix: 'openwrt'
 
     - name: Load custom feeds
       run: |
-        [ -e $FEEDS_CONF ] && mv $FEEDS_CONF openwrt/feeds.conf.default
-        chmod +x $SYS_CONF_SH
+        set -e
+        # 替换 feeds.conf.default
+        [ -e "$FEEDS_CONF" ] && mv "$FEEDS_CONF" openwrt/feeds.conf.default
+
+        chmod +x "$SYS_CONF_SH"
         cd openwrt
-        $GITHUB_WORKSPACE/$SYS_CONF_SH
+        "$GITHUB_WORKSPACE/$SYS_CONF_SH"
 
     - name: Update feeds
-      run: cd openwrt && ./scripts/feeds update -a
+      run: |
+        set -e
+        cd openwrt
+        ./scripts/feeds update -a
 
     - name: Install feeds
-      run: cd openwrt && ./scripts/feeds install -a
-
-    - name: Load custom configuration
       run: |
-        [ -e files ] && mv files openwrt/files
-        [ -e $CONFIG_FILE ] && mv $CONFIG_FILE openwrt/.config
-        chmod +x $PACKS
+        set -e
         cd openwrt
-        $GITHUB_WORKSPACE/$PACKS
+        ./scripts/feeds install -a
+
+    - name: Load custom configuration (RPi5 base)
+      run: |
+        set -e
+        # files 目录（自定义文件）移动到源码里
+        [ -e files ] && mv files openwrt/files
+
+        # RPi5 基础配置作为初始 .config
+        [ -e "$CONFIG_FILE" ] && mv "$CONFIG_FILE" openwrt/.config
+
+        # 执行自定义 package.sh（增加包选项）
+        chmod +x "$PACKS"
+        cd openwrt
+        "$GITHUB_WORKSPACE/$PACKS"
 
     - name: Extend Driver
       if: env.EXTEND_DRIVER == 'true'
       run: |
+        set -e
+        # 追加驱动配置到 .config
         cat configs/Driver.config >> openwrt/.config
 
-    - name: Modify configuration
+    - name: Modify configuration & sync (defconfig)
       run: |
-        cat $EXTERNAL_FILE >> openwrt/.config
-        cd openwrt && make defconfig
-        sed -i '/CONFIG_DEFAULT_luci/'d .config
-        cat .config
+        set -e
+        cd openwrt
+
+        # 追加外部 luci 配置（Standard.config）
+        cat "$GITHUB_WORKSPACE/$EXTERNAL_FILE" >> .config
+
+        # 删除有循环依赖问题的 kmod-oaf 配置，避免 PACKAGE_kmod-oaf 自依赖
+        sed -i '/CONFIG_PACKAGE_kmod-oaf/d' .config
+
+        # 删除默认 luci 相关配置（你原来的逻辑）
+        sed -i '/CONFIG_DEFAULT_luci/d' .config
+
+        # 统一在这里执行一次 defconfig，同步所有配置，避免 "configuration is out of sync"
+        make defconfig
+
+        echo "===== 最终 .config 内容（节选） ====="
+        grep '^CONFIG_TARGET_' .config || true
+        grep 'RPi5' .config || true
 
     - name: Download package
       id: package
       run: |
+        set -e
         cd openwrt
-        # 使用适中的并发数下载，避免并发冲突
-        # GitHub Actions 网络稳定，但某些包在下载阶段需要构建，并发可能导致冲突
-        echo "开始下载包（使用 4 线程并发）..."
+        echo "开始下载包（优先 4 线程并发）..."
         make download -j4 || make download -j1
-        # 清理损坏的下载文件
+
+        echo "清理下载目录中损坏或过小的文件..."
         find dl -size -1024c -exec ls -l {} \;
         find dl -size -1024c -exec rm -f {} \;
 
     - name: Compile the firmware
       id: compile
       run: |
+        set -e
         cd openwrt
         echo -e "$(nproc) thread compile"
-        make -j$(nproc) V=s || make -j4 V=s
-        echo "status=success" >> $GITHUB_OUTPUT
+
+        # 尽量并行编译，不行则退到 4 线程（更稳一点）
+        make -j"$(nproc)" V=s || make -j4 V=s
+
+        echo "status=success" >> "$GITHUB_OUTPUT"
+
+        # 从 .config 中提取设备名
         grep '^CONFIG_TARGET.*DEVICE.*=y' .config | sed -r 's/.*DEVICE_(.*)=y/\1/' > DEVICE_NAME
-        [ -s DEVICE_NAME ] && echo "DEVICE_NAME=_$(cat DEVICE_NAME)" >> $GITHUB_ENV
-        echo "FILE_DATE=_$(date +"%Y%m%d%H%M")" >> $GITHUB_ENV
+        [ -s DEVICE_NAME ] && echo "DEVICE_NAME=_$(cat DEVICE_NAME)" >> "$GITHUB_ENV"
+        echo "FILE_DATE=_$(date +"%Y%m%d%H%M")" >> "$GITHUB_ENV"
 
     - name: Check space usage
       if: (!cancelled())
-      run: df -hT
+      run: |
+        df -hT
 
     - name: Upload bin directory
       uses: actions/upload-artifact@main
@@ -144,10 +182,11 @@ jobs:
       id: organize
       if: steps.compile.outputs.status == 'success' && env.UPLOAD_FIRMWARE == 'true' && !cancelled()
       run: |
+        set -e
         cd openwrt/bin/targets/*/*
         rm -rf packages
-        echo "FIRMWARE=$PWD" >> $GITHUB_ENV
-        echo "status=success" >> $GITHUB_OUTPUT
+        echo "FIRMWARE=$PWD" >> "$GITHUB_ENV"
+        echo "status=success" >> "$GITHUB_OUTPUT"
 
     - name: Upload firmware directory
       uses: actions/upload-artifact@main
@@ -160,14 +199,16 @@ jobs:
       id: tag
       if: steps.compile.outputs.status == 'success' && env.UPLOAD_RELEASE == 'true' && !cancelled()
       run: |
+        set -e
         echo "== Time：$(date +'%Y-%m-%d %H:%M:%S') =="
-        echo "release_tag=$(date +"%Y.%m.%d-%H%M%S")" >> $GITHUB_OUTPUT
+        echo "release_tag=$(date +"%Y.%m.%d-%H%M%S")" >> "$GITHUB_OUTPUT"
         touch release.txt
-        echo "status=success" >> $GITHUB_OUTPUT
+        echo "status=success" >> "$GITHUB_OUTPUT"
 
     - name: Generate release body
       if: steps.compile.outputs.status == 'success' && !cancelled()
       run: |
+        set -e
         echo "![](https://img.shields.io/github/downloads/${{ github.repository }}/${{ steps.tag.outputs.release_tag }}/total?style=flat-square)" >> release.txt
 
     - name: Upload firmware to release
