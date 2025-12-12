@@ -47,6 +47,25 @@ jobs:
         git clone --depth 1 $REPO_URL -b $REPO_BRANCH openwrt
         ln -sf /mnt/workdir/openwrt $GITHUB_WORKSPACE/openwrt
 
+    - name: Fix patch file
+      run: |
+        cd openwrt
+        # 删除或重命名有问题的补丁文件（在编译前处理）
+        # 处理 patches-6.12 目录下的补丁文件
+        PATCH_DIR="target/linux/bcm27xx"
+        PATCH_NAME="950-0358-mmc-sdhci-of-dwcmshc-define-sdio-timeout-clocks.patch"
+        
+        # 查找所有可能的内核版本目录并处理补丁文件
+        for patch_dir in ${PATCH_DIR}/patches-*; do
+          if [ -d "$patch_dir" ]; then
+            PATCH_FILE="${patch_dir}/${PATCH_NAME}"
+            if [ -f "$PATCH_FILE" ]; then
+              echo "发现补丁文件 $PATCH_FILE，将其重命名为 .patch.disabled"
+              mv "$PATCH_FILE" "${PATCH_FILE}.disabled" || true
+            fi
+          fi
+        done
+
     - name: Cache
       uses: stupidloud/cachewrtbuild@main
       with:
