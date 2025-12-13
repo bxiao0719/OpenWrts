@@ -137,13 +137,128 @@ jobs:
         grep '^CONFIG_TARGET_' .config || true
         grep 'RPi5' .config || true
 
-    - name: Download package
+    - name: Download package and tools
       id: package
       run: |
         set -e
         cd openwrt
-        echo "开始下载包（优先 4 线程并发）..."
-        make download -j4 || make download -j1
+        
+        # 下载工具链（tools），包括 erofs-utils 等
+        echo "开始下载工具链（tools）..."
+        MAX_RETRIES=3
+        RETRY=0
+        TOOLS_DOWNLOAD_SUCCESS=false
+        
+        while [ $RETRY -lt $MAX_RETRIES ]; do
+          if make tools/download -j4 V=s; then
+            echo "工具链下载成功！"
+            TOOLS_DOWNLOAD_SUCCESS=true
+            break
+          else
+            RETRY=$((RETRY + 1))
+            if [ $RETRY -lt $MAX_RETRIES ]; then
+              echo "工具链下载失败，等待 5 秒后重试（第 $RETRY 次）..."
+              sleep 5
+            else
+              echo "工具链下载失败，尝试单线程下载..."
+              if make tools/download -j1 V=s; then
+                TOOLS_DOWNLOAD_SUCCESS=true
+                break
+              fi
+            fi
+          fi
+        done
+        
+        # 如果工具链下载失败，尝试手动下载缺失的文件（特别是 erofs-utils）
+        if [ "$TOOLS_DOWNLOAD_SUCCESS" = "false" ]; then
+          echo "工具链下载失败，尝试手动下载缺失的文件..."
+          
+          # 检查 erofs-utils 的 Makefile 获取版本信息
+          if [ -f "tools/erofs-utils/Makefile" ]; then
+            EROFS_VERSION=$(grep "PKG_VERSION:=" tools/erofs-utils/Makefile | cut -d'=' -f2 | tr -d ' ' || echo "1.8.10")
+            EROFS_FILE="erofs-utils-${EROFS_VERSION}.tar.gz"
+            
+            echo "检测到 erofs-utils 版本: $EROFS_VERSION"
+            echo "尝试从多个源下载 $EROFS_FILE..."
+            
+            # 创建 dl 目录
+            mkdir -p dl
+            
+            # 尝试从多个可靠的源下载（优先使用 Debian 官方源）
+            DOWNLOAD_URLS=(
+              "https://ftp.debian.org/debian/pool/main/e/erofs-utils/erofs-utils_${EROFS_VERSION}.orig.tar.gz"
+              "https://sources.voidlinux.org/erofs-utils-${EROFS_VERSION}/erofs-utils-${EROFS_VERSION}.tar.gz"
+              "https://github.com/lixiaoxu/erofs-utils/releases/download/v${EROFS_VERSION}/${EROFS_FILE}"
+              "https://github.com/lixiaoxu/erofs-utils/archive/v${EROFS_VERSION}.tar.gz"
+              "https://git.kernel.org/pub/scm/linux/kernel/git/xiang/erofs-utils.git/snapshot/erofs-utils-${EROFS_VERSION}.tar.gz"
+            )
+            
+            for url in "${DOWNLOAD_URLS[@]}"; do
+              echo "尝试从 $url 下载..."
+              # Debian 源的文件名格式不同，需要临时文件名
+              TEMP_FILE="dl/erofs-utils-temp-$$.tar.gz"
+              if curl -f --connect-timeout 30 --retry 3 -L "$url" -o "$TEMP_FILE" 2>/dev/null; then
+                # 验证文件是否有效（至少大于 1KB）
+                if [ -s "$TEMP_FILE" ] && [ $(stat -f%z "$TEMP_FILE" 2>/dev/null || stat -c%s "$TEMP_FILE" 2>/dev/null) -gt 1024 ]; then
+                  mv "$TEMP_FILE" "dl/${EROFS_FILE}"
+                  echo "成功下载 $EROFS_FILE"
+                  break
+                else
+                  rm -f "$TEMP_FILE"
+                fi
+              fi
+            done
+            
+            # 如果还是失败，尝试下载其他可用版本（从 Debian 源）
+            if [ ! -f "dl/${EROFS_FILE}" ]; then
+              echo "尝试从 Debian 源下载其他可用版本..."
+              for alt_ver in "1.7.1" "1.7" "1.6.1" "1.6"; do
+                alt_file="erofs-utils-${alt_ver}.tar.gz"
+                # 优先尝试 Debian 源
+                if curl -f --connect-timeout 30 --retry 2 -L \
+                  "https://ftp.debian.org/debian/pool/main/e/erofs-utils/erofs-utils_${alt_ver}.orig.tar.gz" \
+                  -o "dl/${alt_file}" 2>/dev/null; then
+                  if [ -s "dl/${alt_file}" ] && [ $(stat -f%z "dl/${alt_file}" 2>/dev/null || stat -c%s "dl/${alt_file}" 2>/dev/null) -gt 1024 ]; then
+                    echo "成功从 Debian 源下载备用版本 $alt_file，创建符号链接..."
+                    ln -sf "$alt_file" "dl/${EROFS_FILE}" || cp "dl/${alt_file}" "dl/${EROFS_FILE}"
+                    break
+                  fi
+                # 如果 Debian 源失败，尝试 GitHub
+                elif curl -f --connect-timeout 30 --retry 2 -L \
+                  "https://github.com/lixiaoxu/erofs-utils/releases/download/v${alt_ver}/${alt_file}" \
+                  -o "dl/${alt_file}" 2>/dev/null; then
+                  if [ -s "dl/${alt_file}" ] && [ $(stat -f%z "dl/${alt_file}" 2>/dev/null || stat -c%s "dl/${alt_file}" 2>/dev/null) -gt 1024 ]; then
+                    echo "成功从 GitHub 下载备用版本 $alt_file，创建符号链接..."
+                    ln -sf "$alt_file" "dl/${EROFS_FILE}" || cp "dl/${alt_file}" "dl/${EROFS_FILE}"
+                    break
+                  fi
+                fi
+              done
+            fi
+          fi
+          
+          echo "重新尝试下载工具链..."
+          make tools/download -j1 V=s || echo "工具链下载仍有问题，将在编译时处理"
+        fi
+        
+        # 下载包（packages）
+        echo "开始下载包（packages）..."
+        RETRY=0
+        while [ $RETRY -lt $MAX_RETRIES ]; do
+          if make download -j4 V=s; then
+            echo "包下载成功！"
+            break
+          else
+            RETRY=$((RETRY + 1))
+            if [ $RETRY -lt $MAX_RETRIES ]; then
+              echo "包下载失败，等待 5 秒后重试（第 $RETRY 次）..."
+              sleep 5
+            else
+              echo "包下载失败，尝试单线程下载..."
+              make download -j1 V=s || true
+            fi
+          fi
+        done
 
         echo "清理下载目录中损坏或过小的文件..."
         find dl -size -1024c -exec ls -l {} \;
@@ -152,14 +267,43 @@ jobs:
     - name: Compile the firmware
       id: compile
       run: |
-        set -e
         cd openwrt
         echo -e "$(nproc) thread compile"
 
-        # 尽量并行编译，不行则退到 4 线程（更稳一点）
-        make -j"$(nproc)" V=s || make -j4 V=s
+        # 尝试编译，如果失败则处理
+        COMPILE_SUCCESS=false
+        if make -j"$(nproc)" V=s 2>&1 | tee compile.log; then
+          COMPILE_SUCCESS=true
+        else
+          echo "编译失败，检查错误原因..."
+          # 检查是否是工具链下载问题
+          if grep -q "No more mirrors to try\|erofs-utils.*failed\|tools/.*failed to build" compile.log; then
+            echo "检测到工具链下载失败，尝试重新下载..."
+            make tools/download -j1 V=s || true
+            echo "重新下载工具链后，降低并发数重试编译..."
+            if make -j4 V=s; then
+              COMPILE_SUCCESS=true
+            else
+              echo "4线程编译失败，尝试单线程编译..."
+              make -j1 V=s && COMPILE_SUCCESS=true
+            fi
+          else
+            echo "非下载问题，降低并发数重试..."
+            if make -j4 V=s; then
+              COMPILE_SUCCESS=true
+            else
+              echo "4线程编译失败，尝试单线程编译..."
+              make -j1 V=s && COMPILE_SUCCESS=true
+            fi
+          fi
+        fi
 
-        echo "status=success" >> "$GITHUB_OUTPUT"
+        if [ "$COMPILE_SUCCESS" = "true" ]; then
+          echo "status=success" >> "$GITHUB_OUTPUT"
+        else
+          echo "编译最终失败"
+          exit 1
+        fi
 
         # 从 .config 中提取设备名
         grep '^CONFIG_TARGET.*DEVICE.*=y' .config | sed -r 's/.*DEVICE_(.*)=y/\1/' > DEVICE_NAME
